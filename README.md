@@ -1,98 +1,293 @@
 # SMSGate
 
-[![CI](https://github.com/alikhalidsherif/smsgate/actions/workflows/ci.yml/badge.svg)](https://github.com/alikhalidsherif/smsgate/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![CI](https://github.com/alikhalidsherif/smsgate/actions/workflows/ci.yml/badge.svg)](https://github.com/alikhalidsherif/smsgate/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.12%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![Docker pulls](https://img.shields.io/badge/docker%20pulls-N%2FA-lightgrey?logo=docker)](https://hub.docker.com/)
+[![Last commit](https://img.shields.io/github/last-commit/alikhalidsherif/smsgate)](https://github.com/alikhalidsherif/smsgate/commits/main)
 
-Self-hosted SMS + USSD gateway for Huawei E5331/E5-series modems, designed as an adapter layer for **n8n automation hubs**.
+SMSGate is a self-hosted SMS + USSD gateway for Huawei E5331/E5-series modems.
 
-It exposes a clean HTTP API for sending SMS, polling inbox, running USSD sessions, and basic modem ops while handling flaky modem HTTP behavior with retries, forced short-lived connections, and recovery-aware polling.
+Use it as an adapter layer: **n8n orchestrates your automations**, and SMSGate handles the modem-level work (SMS, USSD, retries, polling, persistence, and health telemetry).
 
-## Keywords
+## What you get
 
-sms gateway, huawei e5331, huawei modem api, ethio telecom, n8n, automation, ussd, flask, docker, self-hosted
+- SMS send API with delivery-report-aware history
+- Live modem inbox reads and persistent SQLite history
+- Three USSD modes: single-shot, automated multi-step, and live WebSocket
+- Background polling and cleanup workers
+- Webhook push for inbound SMS and delivery reports
+- Modem health endpoint for monitoring and alerting
 
-## Suggested GitHub Topics
+## 10-minute quick start
 
-`sms-gateway`, `huawei-modem`, `e5331`, `n8n`, `automation`, `ussd`, `docker`, `flask`, `sqlite`, `ethio-telecom`
-
-## Features
-
-- Send SMS (`/sms/send`) and track sent history (`/sms/sent`)
-- Poll inbox from modem + persist into SQLite (`/sms/history`)
-- Delivery report tagging heuristics
-- Automated and live USSD session support
-- Runtime config endpoint (`/config`)
-- Modem health endpoint for monitoring (`/health/modem`)
-- Modem cleanup worker (age + threshold based)
-- Auth via `X-Admin-Key`
-- Dockerized deployment
-
-## Architecture
-
-- **Gateway role**: thin modem abstraction layer and reliability wrapper
-- **n8n role**: orchestration hub that calls gateway endpoints and routes events to automations
-- **Storage**: SQLite for message history + runtime config
-
-## Repository Layout
-
-- `gateway.py` - API server + modem adapter logic
-- `docker-compose.yml` - local container run setup
-- `n8n-workflows/` - importable starter workflow JSONs
-- `HANDOFF.md` - operational runbook and n8n cheatsheet
-- `.env.example` - environment variable template
-
-## Quick Start
-
-1. Copy env template:
+1) Clone and configure:
 
 ```bash
+git clone https://github.com/alikhalidsherif/smsgate.git
+cd smsgate
 cp .env.example .env
 ```
 
-2. Edit `.env` and set at minimum:
+2) Edit `.env` and set at least:
 
 - `ADMIN_KEY`
 - `ROUTER_PASS`
 
-3. Start:
+3) Start SMSGate:
 
 ```bash
 docker compose up -d --build
 ```
 
-4. Check routes:
+4) Smoke test:
 
 ```bash
 curl -s http://127.0.0.1:5000/routes
+curl -s -H "X-Admin-Key: <ADMIN_KEY>" http://127.0.0.1:5000/health/modem
 ```
 
-## Run n8n Locally (Optional)
-
-If you want n8n in Docker on the same network as SMSGate:
+Optional: run n8n on the same Docker network:
 
 ```bash
-docker compose up -d
 docker compose -f docker-compose.n8n.yml up -d
 ```
 
-Then open n8n at `http://127.0.0.1:5678`.
+Open n8n at `http://127.0.0.1:5678`.
 
-Because both services share `smsgate-net`, workflow URLs can use `http://smsgate:5000`.
+## Architecture and data model
 
-## Security Notes
+- **`/sms`** reads directly from the modem storage (live view, limited by modem inbox/sent slots).
+- **`/sms/history`** reads from SQLite (`DB_PATH`) and represents your long-term history.
 
-- Never commit `.env` to git.
-- `X-Admin-Key` is required for protected endpoints.
-- Rotate `ADMIN_KEY` if exposed.
-- Run behind a reverse proxy/Tailscale/VPN for internet exposure.
+In practice:
 
-## API Overview
+- Use `/sms` when you need current modem state.
+- Use `/sms/history` for reporting, automation, auditing, and searchable historical data.
 
-Public:
+## Webhooks
 
-- `GET /routes`
+Set `WEBHOOK_URL` to receive inbound events from SMSGate.
 
-Protected (requires `X-Admin-Key`):
+SMSGate sends an HTTP `POST` when the poller processes a new unread modem message:
+
+- `type: "sms_received"` for regular inbound messages
+- `type: "delivery_report"` when the message matches delivery-report heuristic rules
+
+### Payload shape
+
+```json
+{
+  "type": "sms_received",
+  "id": 101,
+  "phone": "+251911234567",
+  "content": "hello from customer",
+  "date": "2026-04-17 09:30:45",
+  "sms_type": "1"
+}
+```
+
+```json
+{
+  "type": "delivery_report",
+  "id": 102,
+  "phone": "994",
+  "content": "Delivered to +251911234567",
+  "date": "2026-04-17 09:31:05",
+  "sms_type": "7"
+}
+```
+
+### n8n setup for webhook receive
+
+1. In n8n, add a **Webhook** node (method `POST`).
+2. Copy its production URL.
+3. Set that URL as `WEBHOOK_URL` (in `.env` or `POST /config`).
+4. Activate workflow; SMSGate will `POST` each new event payload to n8n.
+
+## Delivery report heuristics
+
+Delivery reports are classified in code using a heuristic:
+
+- Content contains one of: `delivered`, `not delivered`, `delivery`, `failed to deliver`
+- Sender address length is `<= 10` characters (typically short code / service sender)
+
+This is intentionally heuristic and may need adjustment for your carrier format.
+
+## USSD modes
+
+SMSGate supports three USSD interaction models.
+
+### 1) Single-shot USSD (`POST /ussd/send`)
+
+Best for one request/one response interactions.
+
+Request:
+
+```bash
+curl -s -X POST http://127.0.0.1:5000/ussd/send \
+  -H "X-Admin-Key: <ADMIN_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"code":"*804#"}'
+```
+
+Success response:
+
+```json
+{
+  "code": "*804#",
+  "response": "Your menu text..."
+}
+```
+
+Busy/timeout/error examples:
+
+- `423` if another USSD session is active
+- `504` if no network response before timeout
+- `502` for modem/API errors
+
+### 2) Automated multi-step USSD (`POST /ussd/session`)
+
+Provide an ordered `steps` array. SMSGate sends each step and waits for response before next.
+
+Ethio Telecom style example (`*804#` then choose option `1`):
+
+```bash
+curl -s -X POST http://127.0.0.1:5000/ussd/session \
+  -H "X-Admin-Key: <ADMIN_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"steps":["*804#","1"]}'
+```
+
+Example response:
+
+```json
+{
+  "steps_run": 2,
+  "history": [
+    {
+      "step": 1,
+      "input": "*804#",
+      "response": "Welcome ..."
+    },
+    {
+      "step": 2,
+      "input": "1",
+      "response": "Your balance is ..."
+    }
+  ]
+}
+```
+
+### 3) Live turn-based USSD over WebSocket (`GET /ussd/live`)
+
+Use this when menus branch dynamically and you want interactive control.
+
+Server behavior:
+
+- Only one active USSD session at a time
+- New connection receives `{"status":"ready"}`
+- If busy: `{"status":"busy","error":"Another USSD session is active"}`
+- Idle timeout is 120 seconds -> server sends timeout message and ends session
+- On disconnect/error, lock is released automatically
+
+Client message formats:
+
+- `{"code":"*804#"}` start session
+- `{"input":"1"}` reply to menu
+- `{"action":"ping"}` keepalive
+- `{"action":"cancel"}` cancel session
+
+Server message formats:
+
+- `{"status":"ready"}`
+- `{"menu":"..."}`
+- `{"status":"pong"}`
+- `{"status":"cancelled"}`
+- `{"status":"timeout","error":"..."}`
+- `{"error":"..."}`
+
+`wscat` example:
+
+```bash
+wscat -c ws://127.0.0.1:5000/ussd/live
+```
+
+Example exchange:
+
+```text
+< {"status":"ready","message":"Send {\"code\": \"*XXX#\"} to begin"}
+> {"code":"*804#"}
+< {"menu":"Welcome ..."}
+> {"input":"1"}
+< {"menu":"Your balance is ..."}
+> {"action":"cancel"}
+< {"status":"cancelled"}
+```
+
+Minimal Python WebSocket client example:
+
+```python
+import asyncio
+import json
+import websockets
+
+async def main():
+    async with websockets.connect("ws://127.0.0.1:5000/ussd/live") as ws:
+        print(await ws.recv())
+        await ws.send(json.dumps({"code": "*804#"}))
+        print(await ws.recv())
+        await ws.send(json.dumps({"input": "1"}))
+        print(await ws.recv())
+        await ws.send(json.dumps({"action": "cancel"}))
+        print(await ws.recv())
+
+asyncio.run(main())
+```
+
+## Modem reboot endpoint (`POST /device/reboot`)
+
+Use this only for recovery operations. It requires explicit confirmation header and will make modem unreachable briefly.
+
+```bash
+curl -s -X POST http://127.0.0.1:5000/device/reboot \
+  -H "X-Admin-Key: <ADMIN_KEY>" \
+  -H "X-Confirm: yes"
+```
+
+Response:
+
+```json
+{
+  "result": "OK",
+  "note": "Modem will be unreachable for ~30 seconds"
+}
+```
+
+## Cleanup worker
+
+The cleanup worker runs in the background and protects modem storage.
+
+What it does each cycle:
+
+1. Reads modem messages
+2. Stores messages into SQLite first
+3. Deletes from modem by age and/or overflow thresholds
+
+Controls:
+
+- `CLEANUP_INTERVAL` -> run frequency (seconds)
+- `MODEM_MESSAGE_MAX_AGE` -> delete modem messages older than N days
+- `MODEM_MAX_THRESHOLD` -> if modem still over limit, delete oldest until under threshold
+
+## API reference
+
+### Public endpoints
+
+- `GET /routes` - endpoint discovery
+- `GET /ussd/live` - WebSocket USSD (no header auth; secure by network boundary)
+
+### Protected endpoints (require `X-Admin-Key`)
 
 - `GET /config`
 - `POST /config`
@@ -111,116 +306,206 @@ Protected (requires `X-Admin-Key`):
 - `GET /device/info`
 - `POST /device/reboot`
 
-WebSocket:
+## POST endpoint examples (request + response)
 
-- `GET /ussd/live`
+### `POST /config`
 
-## Core Env Vars
+Request:
 
-See `.env.example` for full list.
+```bash
+curl -s -X POST http://127.0.0.1:5000/config \
+  -H "X-Admin-Key: <ADMIN_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"poll_interval":20,"webhook_url":"http://n8n:5678/webhook/smsgate-events"}'
+```
+
+Response:
+
+```json
+{
+  "updated": {
+    "poll_interval": 20,
+    "webhook_url": "http://n8n:5678/webhook/smsgate-events"
+  },
+  "errors": {}
+}
+```
+
+### `POST /sms/send`
+
+Request:
+
+```bash
+curl -s -X POST http://127.0.0.1:5000/sms/send \
+  -H "X-Admin-Key: <ADMIN_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"to":"+2519XXXXXXXX","message":"hello from smsgate","delivery_report":true}'
+```
+
+Response:
+
+```json
+{
+  "result": "OK",
+  "to": ["+2519XXXXXXXX"],
+  "message": "hello from smsgate",
+  "delivery_report": true
+}
+```
+
+### `POST /sms/mark-read/<index>`
+
+Request:
+
+```bash
+curl -s -X POST http://127.0.0.1:5000/sms/mark-read/20052 \
+  -H "X-Admin-Key: <ADMIN_KEY>"
+```
+
+Response:
+
+```json
+{
+  "index": 20052,
+  "result": "OK"
+}
+```
+
+### `POST /ussd/send`
+
+Request:
+
+```bash
+curl -s -X POST http://127.0.0.1:5000/ussd/send \
+  -H "X-Admin-Key: <ADMIN_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"code":"*804#"}'
+```
+
+Response:
+
+```json
+{
+  "code": "*804#",
+  "response": "Your menu text..."
+}
+```
+
+### `POST /ussd/session`
+
+Request:
+
+```bash
+curl -s -X POST http://127.0.0.1:5000/ussd/session \
+  -H "X-Admin-Key: <ADMIN_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"steps":["*804#","1"]}'
+```
+
+Response:
+
+```json
+{
+  "steps_run": 2,
+  "history": [
+    {
+      "step": 1,
+      "input": "*804#",
+      "response": "Welcome ..."
+    },
+    {
+      "step": 2,
+      "input": "1",
+      "response": "Your balance is ..."
+    }
+  ]
+}
+```
+
+### `POST /device/reboot`
+
+Request:
+
+```bash
+curl -s -X POST http://127.0.0.1:5000/device/reboot \
+  -H "X-Admin-Key: <ADMIN_KEY>" \
+  -H "X-Confirm: yes"
+```
+
+Response:
+
+```json
+{
+  "result": "OK",
+  "note": "Modem will be unreachable for ~30 seconds"
+}
+```
+
+## n8n workflow JSONs (included)
+
+Starter files in `n8n-workflows/`:
+
+- `01-health-monitor-alert.json`
+- `02-send-sms-webhook.json`
+- `03-inbox-sync.json`
+
+Import steps:
+
+1. n8n UI -> Workflows -> Import from File
+2. Pick one JSON file
+3. Replace `CHANGE_ME_ADMIN_KEY`
+4. Replace phone placeholders (`+2519XXXXXXXX`)
+5. If n8n is outside Docker network, replace `http://smsgate:5000` with reachable host URL
+6. Save, run once manually, then activate
+
+## Environment variables
+
+Required:
+
+- `ADMIN_KEY`
+- `ROUTER_PASS`
+
+Commonly tuned:
 
 - `APP_HOST`, `APP_PORT`
-- `ADMIN_KEY`
 - `DB_PATH`
-- `ROUTER_URL`, `ROUTER_USER`, `ROUTER_PASS`
+- `ROUTER_URL`, `ROUTER_USER`
 - `WEBHOOK_URL`
 - `POLL_INTERVAL`, `CLEANUP_INTERVAL`
+- `MODEM_MAX_THRESHOLD`, `MODEM_MESSAGE_MAX_AGE`
 - `MODEM_CONNECT_TIMEOUT`, `MODEM_READ_TIMEOUT`
 - `MODEM_CONNECT_RETRIES`, `MODEM_RETRY_BACKOFF`
 - `MODEM_FORCE_CONNECTION_CLOSE`
 - `POLL_BACKOFF_MAX`, `POLL_ERROR_LOG_THROTTLE`
 
-## n8n Starter Flows (Concept)
+See `.env.example` for full defaults.
 
-### 1) Scheduled modem health check (recommended first flow)
+## Development and operations
 
-- Trigger: every 5 minutes
-- HTTP Request: `GET /health/modem`
-- IF: `consecutive_failures > 2` or `status == "degraded"`
-- Action: notify Telegram/Email/SMS
-
-### 2) Send SMS automation
-
-- Trigger: webhook/cron/db event
-- HTTP Request: `POST /sms/send`
-- Body: `{"to":"+2519...","message":"..."}`
-
-### 3) Inbox sync automation
-
-- Trigger: every 1-5 minutes
-- HTTP Request: `GET /sms/history?page=1&limit=50`
-- Store or route to CRM/Sheets/ERP
-
-## Ready-to-import n8n Workflows
-
-Prebuilt example workflows are included in `n8n-workflows/`:
-
-- `n8n-workflows/01-health-monitor-alert.json`
-- `n8n-workflows/02-send-sms-webhook.json`
-- `n8n-workflows/03-inbox-sync.json`
-
-Import steps in n8n:
-
-1. Open n8n -> Workflows -> Import from File
-2. Select a JSON from `n8n-workflows/`
-3. Update all `CHANGE_ME_ADMIN_KEY` placeholders
-4. Update phone placeholders (`+2519XXXXXXXX`)
-5. If n8n runs outside Docker, replace `http://smsgate:5000` with your reachable host URL
-6. Save and activate
-
-Tip: start with `01-health-monitor-alert.json`, confirm alerts work, then import the other two.
-
-## Health Endpoint
-
-`GET /health/modem` returns a snapshot including:
-
-- `status` (`healthy`/`degraded`)
-- `consecutive_failures`
-- `total_failures`
-- `recoveries`
-- `last_poll_success_at`
-- `last_poll_error_at`
-- `last_poll_error`
-- `last_backoff_seconds`
-- `last_sms_received_at`
-
-This endpoint is intended for n8n monitoring and alert thresholds.
-
-## Development
-
-Run syntax check:
+Syntax check:
 
 ```bash
-uv run python -m py_compile gateway.py
+uv run python -m py_compile gateway.py discover.py setup.py introspect.py
 ```
 
-Run container logs:
+Build/run:
+
+```bash
+docker compose up -d --build
+```
+
+Logs:
 
 ```bash
 docker logs -f smsgate
 ```
 
-Run local smoke checks:
+## Security notes
 
-```bash
-curl -s http://127.0.0.1:5000/routes
-curl -s -H "X-Admin-Key: $ADMIN_KEY" http://127.0.0.1:5000/health/modem
-```
-
-## Helper Scripts
-
-- `discover.py` probes modem API capabilities
-- `setup.py` network mode helper
-- `introspect.py` prints available `huawei-lte-api` classes/methods
-
-All helpers read modem credentials from environment variables.
-
-## Roadmap Ideas
-
-- FastAPI migration (`/v2`) with typed schemas + OpenAPI
-- Optional auto-reboot with cooldown + explicit feature flag
-- Prometheus metrics endpoint
-- Rate limiting and request audit logs
+- Never commit `.env`
+- Rotate `ADMIN_KEY` if exposed
+- Keep gateway private (VPN/Tailscale/reverse proxy)
+- Treat modem management endpoints as privileged operations
 
 ## License
 
