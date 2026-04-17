@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![CI](https://github.com/alikhalidsherif/smsgate/actions/workflows/ci.yml/badge.svg)](https://github.com/alikhalidsherif/smsgate/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Docker pulls](https://img.shields.io/badge/docker%20pulls-N%2FA-lightgrey?logo=docker)](https://hub.docker.com/)
+[![Docker Ready](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](docker-compose.yml)
 [![Last commit](https://img.shields.io/github/last-commit/alikhalidsherif/smsgate)](https://github.com/alikhalidsherif/smsgate/commits/main)
 
 SMSGate is a self-hosted SMS + USSD gateway for Huawei E5331/E5-series modems.
@@ -457,6 +457,13 @@ Import steps:
 4. Replace phone placeholders (`+2519XXXXXXXX`)
 5. If n8n is outside Docker network, replace `http://smsgate:5000` with reachable host URL
 6. Save, run once manually, then activate
+
+## n8n troubleshooting
+
+- **401 Unauthorized**: request is missing `X-Admin-Key` or key is wrong. Add the header to every protected endpoint request and ensure it matches `ADMIN_KEY`.
+- **423 Busy**: another USSD session is already active (`/ussd/send`, `/ussd/session`, and `/ussd/live` share the same modem session lock). Wait for current session to finish, or cancel the active live WebSocket session.
+- **Connection timeout from n8n to gateway**: `http://smsgate:5000` only works when both containers are on `smsgate-net`. If n8n runs outside Docker (or different network), use host-reachable URL instead, e.g. `http://<host-ip>:5000`.
+- **Poller backoff looks like "slow polling"**: if `/health/modem` shows `consecutive_failures > 0`, SMS poll interval is temporarily increased by backoff. This is expected resilience behavior, not a gateway crash. Track `last_backoff_seconds`, `last_poll_success_at`, and `status` for recovery.
 
 ## Environment variables
 
