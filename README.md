@@ -1,5 +1,8 @@
 # SMSGate
 
+[![CI](https://github.com/alikhalidsherif/smsgate/actions/workflows/ci.yml/badge.svg)](https://github.com/alikhalidsherif/smsgate/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 Self-hosted SMS + USSD gateway for Huawei E5331/E5-series modems, designed as an adapter layer for **n8n automation hubs**.
 
 It exposes a clean HTTP API for sending SMS, polling inbox, running USSD sessions, and basic modem ops while handling flaky modem HTTP behavior with retries, forced short-lived connections, and recovery-aware polling.
@@ -30,6 +33,14 @@ sms gateway, huawei e5331, huawei modem api, ethio telecom, n8n, automation, uss
 - **n8n role**: orchestration hub that calls gateway endpoints and routes events to automations
 - **Storage**: SQLite for message history + runtime config
 
+## Repository Layout
+
+- `gateway.py` - API server + modem adapter logic
+- `docker-compose.yml` - local container run setup
+- `n8n-workflows/` - importable starter workflow JSONs
+- `HANDOFF.md` - operational runbook and n8n cheatsheet
+- `.env.example` - environment variable template
+
 ## Quick Start
 
 1. Copy env template:
@@ -54,6 +65,19 @@ docker compose up -d --build
 ```bash
 curl -s http://127.0.0.1:5000/routes
 ```
+
+## Run n8n Locally (Optional)
+
+If you want n8n in Docker on the same network as SMSGate:
+
+```bash
+docker compose up -d
+docker compose -f docker-compose.n8n.yml up -d
+```
+
+Then open n8n at `http://127.0.0.1:5678`.
+
+Because both services share `smsgate-net`, workflow URLs can use `http://smsgate:5000`.
 
 ## Security Notes
 
@@ -144,6 +168,8 @@ Import steps in n8n:
 5. If n8n runs outside Docker, replace `http://smsgate:5000` with your reachable host URL
 6. Save and activate
 
+Tip: start with `01-health-monitor-alert.json`, confirm alerts work, then import the other two.
+
 ## Health Endpoint
 
 `GET /health/modem` returns a snapshot including:
@@ -174,6 +200,13 @@ Run container logs:
 docker logs -f smsgate
 ```
 
+Run local smoke checks:
+
+```bash
+curl -s http://127.0.0.1:5000/routes
+curl -s -H "X-Admin-Key: $ADMIN_KEY" http://127.0.0.1:5000/health/modem
+```
+
 ## Helper Scripts
 
 - `discover.py` probes modem API capabilities
@@ -188,3 +221,7 @@ All helpers read modem credentials from environment variables.
 - Optional auto-reboot with cooldown + explicit feature flag
 - Prometheus metrics endpoint
 - Rate limiting and request audit logs
+
+## License
+
+MIT. See `LICENSE`.

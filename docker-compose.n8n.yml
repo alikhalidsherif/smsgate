@@ -1,0 +1,25 @@
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - GENERIC_TIMEZONE=Africa/Addis_Ababa
+      - TZ=Africa/Addis_Ababa
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - smsgate-net
+
+volumes:
+  n8n_data:
+
+networks:
+  smsgate-net:
+    external: true
+    name: smsgate-net

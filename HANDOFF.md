@@ -25,6 +25,14 @@ Check:
 curl -s http://127.0.0.1:5000/routes
 ```
 
+Optional: run n8n in Docker on same network:
+
+```bash
+docker compose -f docker-compose.n8n.yml up -d
+```
+
+Open `http://127.0.0.1:5678`.
+
 ## 2) Most useful endpoints for n8n
 
 Base URL: `http://<host>:5000`
@@ -114,6 +122,16 @@ It keeps `lastSeenId` in n8n static workflow storage and only emits new messages
 5. Replace `+2519XXXXXXXX` placeholders
 6. If n8n is not in same Docker network, replace `http://smsgate:5000`
 7. Save and Activate
+
+## 5.2) Suggested first 30-minute n8n learning path
+
+1. Import `01-health-monitor-alert.json`
+2. Set your real `X-Admin-Key`
+3. Trigger it manually once (Execute Workflow)
+4. Confirm alert branch logic in execution view
+5. Activate it and watch runs for 10-15 minutes
+6. Import `02-send-sms-webhook.json`
+7. Send test payload via curl/Postman to n8n webhook URL
 
 ## 6) Runtime tuning
 
