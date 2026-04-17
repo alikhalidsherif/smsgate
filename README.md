@@ -501,6 +501,8 @@ Build/run:
 docker compose up -d --build
 ```
 
+The container runs with Gunicorn (`wsgi:app`) instead of Flask dev server.
+
 Logs:
 
 ```bash

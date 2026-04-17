@@ -113,6 +113,8 @@ ussd_lock = threading.Lock()
 ussd_session_ws = None  # the active WS connection object, if any
 modem_api_lock = threading.Lock()  # prevent overlapping modem login sessions
 health_lock = threading.Lock()
+runtime_lock = threading.Lock()
+runtime_started = False
 
 modem_health = {
     "started_at": utc_now_iso(),
@@ -1249,10 +1251,21 @@ def start_background_threads():
     log.info("Background threads started")
 
 
+def bootstrap_runtime():
+    global runtime_started
+
+    with runtime_lock:
+        if runtime_started:
+            return
+
+        validate_runtime_config()
+        init_db()
+        start_background_threads()
+        runtime_started = True
+
+
 if __name__ == "__main__":
-    validate_runtime_config()
-    init_db()
-    start_background_threads()
+    bootstrap_runtime()
     log.info("=" * 60)
     log.info("SMS Gateway on http://%s:%d", APP_HOST, APP_PORT)
     log.info("WebSocket USSD live: ws://%s:%d/ussd/live", APP_HOST, APP_PORT)
