@@ -1,0 +1,22 @@
+services:
+  gateway:
+    build: .
+    container_name: smsgate
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${APP_PORT:-5000}:${APP_PORT:-5000}"
+    volumes:
+      - ./gateway.py:/app/gateway.py
+      - sms_data:/data
+    networks:
+      - smsgate-net
+
+volumes:
+  sms_data:
+
+networks:
+  smsgate-net:
+    name: smsgate-net
+    driver: bridge

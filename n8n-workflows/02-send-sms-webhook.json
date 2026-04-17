@@ -1,0 +1,96 @@
+{
+  "name": "SMSGate - Send SMS via Incoming Webhook",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "smsgate/send",
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      },
+      "id": "f2-webhook",
+      "name": "Incoming Send Request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "webhookId": "smsgate-send"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://smsgate:5000/sms/send",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Admin-Key",
+              "value": "CHANGE_ME_ADMIN_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"to\": ($json.body && $json.body.to) ? $json.body.to : $json.to, \"message\": ($json.body && $json.body.message) ? $json.body.message : $json.message, \"delivery_report\": ($json.body && $json.body.delivery_report !== undefined) ? $json.body.delivery_report : true}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "f2-send",
+      "name": "Send via SMSGate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}"
+      },
+      "id": "f2-respond",
+      "name": "Respond to Caller",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [
+        760,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Incoming Send Request": {
+      "main": [
+        [
+          {
+            "node": "Send via SMSGate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send via SMSGate": {
+      "main": [
+        [
+          {
+            "node": "Respond to Caller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

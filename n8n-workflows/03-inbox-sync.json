@@ -1,0 +1,92 @@
+{
+  "name": "SMSGate - Inbox Sync (Incremental)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 2
+            }
+          ]
+        }
+      },
+      "id": "f3-schedule",
+      "name": "Every 2 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://smsgate:5000/sms/history?page=1&limit=100",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Admin-Key",
+              "value": "CHANGE_ME_ADMIN_KEY"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "f3-fetch",
+      "name": "Fetch SMS History",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        470,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json || {};\nconst msgs = data.messages || [];\nconst st = this.getWorkflowStaticData('global');\nif (typeof st.lastSeenId !== 'number') st.lastSeenId = 0;\n\nconst freshAsc = msgs\n  .filter(m => Number(m.id || 0) > st.lastSeenId)\n  .sort((a, b) => Number(a.id || 0) - Number(b.id || 0));\n\nif (freshAsc.length > 0) {\n  st.lastSeenId = Number(freshAsc[freshAsc.length - 1].id || st.lastSeenId);\n}\n\nreturn freshAsc.map(m => ({ json: m }));"
+      },
+      "id": "f3-filter",
+      "name": "Filter New Messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        320
+      ]
+    }
+  ],
+  "connections": {
+    "Every 2 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Fetch SMS History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch SMS History": {
+      "main": [
+        [
+          {
+            "node": "Filter New Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
