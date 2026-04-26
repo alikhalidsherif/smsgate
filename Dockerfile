@@ -1,6 +1,8 @@
 FROM python:3.12-slim
 
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 TZ=Africa/Addis_Ababa
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir huawei-lte-api flask flask-sock requests gunicorn
 

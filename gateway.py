@@ -11,6 +11,7 @@ delivery reports, auto-cleanup, device control.
 import json
 import os
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -23,6 +24,7 @@ from flask_sock import Sock
 from huawei_lte_api.Client import Client
 from huawei_lte_api.Connection import Connection
 from huawei_lte_api.enums.sms import BoxTypeEnum
+from huawei_lte_api.exceptions import ResponseErrorException
 
 try:
     import requests as http_requests
@@ -92,6 +94,8 @@ MODEM_RETRY_BACKOFF = env_float("MODEM_RETRY_BACKOFF", 1.0)
 MODEM_FORCE_CONNECTION_CLOSE = env_bool("MODEM_FORCE_CONNECTION_CLOSE", True)
 POLL_ERROR_LOG_THROTTLE = env_int("POLL_ERROR_LOG_THROTTLE", 60)
 POLL_BACKOFF_MAX = env_int("POLL_BACKOFF_MAX", 60)
+SMS_SEND_STATUS_WAIT_SECONDS = env_float("SMS_SEND_STATUS_WAIT_SECONDS", 8.0)
+SMS_SEND_STATUS_POLL_INTERVAL = env_float("SMS_SEND_STATUS_POLL_INTERVAL", 1.0)
 
 # Runtime defaults (overridable via POST /config)
 DEFAULT_CONFIG = {
@@ -318,6 +322,21 @@ def get_client():
             try:
                 if http_requests is not None:
                     session = http_requests.Session()
+
+                    def sanitize_xml(r, *args, **kwargs):
+                        try:
+                            text = r.content.decode("utf-8", errors="replace")
+                            clean = re.sub(
+                                r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]",
+                                "?",
+                                text,
+                            )
+                            r._content = clean.encode("utf-8")
+                        except Exception:
+                            pass
+
+                    session.hooks["response"].append(sanitize_xml)
+
                     if MODEM_FORCE_CONNECTION_CLOSE:
                         session.headers.update({"Connection": "close"})
 
@@ -390,6 +409,29 @@ def parse_positive_int(value, default):
         return default
 
 
+def parse_positive_float(value, default):
+    try:
+        parsed = float(value)
+        return parsed if parsed > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_modem_error_code(error: Exception):
+    if isinstance(error, ResponseErrorException):
+        return int(getattr(error, "code", 0))
+
+    text = str(error)
+    m = re.match(r"\s*(\d{5,6})\s*:", text)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+
+    return None
+
+
 def fetch_modem_messages(client, box=BoxTypeEnum.LOCAL_INBOX, page=1, count=50):
     raw = client.sms.get_sms_list(page, box, count, 0, 0, 0)
     messages = []
@@ -397,6 +439,152 @@ def fetch_modem_messages(client, box=BoxTypeEnum.LOCAL_INBOX, page=1, count=50):
         messages = safe_list(raw["Messages"]["Message"])
     total = int(raw.get("Count", len(messages))) if raw else 0
     return messages, total
+
+
+def normalize_phone(value) -> str:
+    phone = str(value or "").strip()
+    if phone.startswith("251"):
+        phone = "+" + phone
+    return phone
+
+
+def split_modem_phone_field(value):
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        chunks = value
+    else:
+        chunks = str(value).replace(",", ";").split(";")
+
+    phones = []
+    for chunk in chunks:
+        p = normalize_phone(chunk)
+        if p and p.lower() != "none":
+            phones.append(p)
+    return phones
+
+
+def summarize_send_status(raw_status: dict, recipients):
+    target = {normalize_phone(r) for r in recipients if normalize_phone(r)}
+    successful = set(split_modem_phone_field(raw_status.get("SucPhone")))
+    failed = set(split_modem_phone_field(raw_status.get("FailPhone")))
+    pending = set(split_modem_phone_field(raw_status.get("Phone")))
+
+    target_related = (successful | failed | pending) & target if target else set()
+    covered = successful | failed
+    completed = not target or target.issubset(covered)
+
+    if target and target.issubset(successful):
+        state = "success"
+    elif target & failed and completed:
+        state = "failed"
+    elif target & failed:
+        state = "partial"
+    elif target & pending:
+        state = "pending"
+    elif completed:
+        state = "completed_unknown"
+    elif not target_related:
+        state = "stale"
+    else:
+        state = "unknown"
+
+    return {
+        "state": state,
+        "completed": completed,
+        "successful_recipients": sorted(successful),
+        "failed_recipients": sorted(failed),
+        "pending_recipients": sorted(pending),
+        "raw": raw_status,
+    }
+
+
+def evaluate_send_result(result, recipients, send_outcome):
+    normalized = [normalize_phone(r) for r in recipients if normalize_phone(r)]
+
+    if not send_outcome:
+        return {
+            "ok": str(result).upper() == "OK",
+            "state": "unknown",
+            "reason": "no send status",
+        }
+
+    state = send_outcome.get("state")
+    successful = set(send_outcome.get("successful_recipients") or [])
+    failed = set(send_outcome.get("failed_recipients") or [])
+    pending = set(send_outcome.get("pending_recipients") or [])
+
+    target = set(normalized)
+    all_success = bool(target) and target.issubset(successful)
+    any_failed = bool(target & failed)
+    any_pending = bool(target & pending)
+
+    if all_success:
+        return {"ok": True, "state": "success", "reason": "all recipients succeeded"}
+
+    if any_failed:
+        return {
+            "ok": False,
+            "state": "failed",
+            "reason": "one or more recipients failed",
+        }
+
+    if any_pending:
+        return {
+            "ok": False,
+            "state": "pending",
+            "reason": "delivery still pending",
+        }
+
+    if state == "stale":
+        return {
+            "ok": False,
+            "state": "unknown",
+            "reason": "send status appears stale for another recipient",
+        }
+
+    if str(result).upper() != "OK":
+        return {
+            "ok": False,
+            "state": "failed",
+            "reason": f"modem returned {result}",
+        }
+
+    return {
+        "ok": False,
+        "state": "unknown",
+        "reason": "no definitive recipient outcome within wait window",
+    }
+
+
+def wait_for_send_outcome(client, recipients, timeout_seconds):
+    deadline = time.time() + max(0.0, timeout_seconds)
+    poll_step = max(0.2, SMS_SEND_STATUS_POLL_INTERVAL)
+
+    last = {
+        "state": "unknown",
+        "completed": False,
+        "successful_recipients": [],
+        "failed_recipients": [],
+        "pending_recipients": [],
+        "raw": {},
+    }
+
+    while True:
+        try:
+            raw_status = client.sms.send_status()
+            raw_status = raw_status if isinstance(raw_status, dict) else {}
+            last = summarize_send_status(raw_status, recipients)
+        except Exception as e:
+            last["state"] = "status_error"
+            last["status_error"] = str(e)
+            return last
+
+        if last["completed"] or time.time() >= deadline:
+            return last
+
+        time.sleep(poll_step)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -464,6 +652,7 @@ def is_transient_modem_error(error: Exception) -> bool:
         "connect timeout",
         "max retries exceeded",
         "modem unavailable",
+        "113018",
     )
     return any(marker in text for marker in transient_markers)
 
@@ -488,8 +677,31 @@ def sms_poller():
 
                 new_msgs = [m for m in messages if str(m.get("Smstat", "1")) == "0"]
 
+                # Sort by index so if multiple parts arrive in the exact same second, they read in order
+                try:
+                    new_msgs.sort(key=lambda x: int(x.get("Index", -1)))
+                except Exception:
+                    pass
+
                 for msg in new_msgs:
                     is_dr = is_delivery_report(msg)
+
+                    # Anti-Spam Filter (Blocks exact duplicate spam within 60s)
+                    is_spam = False
+                    if not is_dr:
+                        with get_bg_db() as db:
+                            recent = db.execute(
+                                """
+                                SELECT id FROM messages 
+                                WHERE phone = ? AND content = ? 
+                                AND received_at >= datetime('now', '-60 seconds')
+                            """,
+                                (msg.get("Phone"), msg.get("Content")),
+                            ).fetchone()
+                            if recent:
+                                is_spam = True
+
+                    # Save to Database
                     with get_bg_db() as db:
                         row_id = store_message(db, msg, is_dr)
                         db.execute(
@@ -497,35 +709,35 @@ def sms_poller():
                             (row_id,),
                         )
 
-                    # Mark read on modem
+                    # Mark read on modem instantly
                     try:
                         client.sms.set_read(int(msg["Index"]))
                     except Exception as e:
-                        log.warning(
-                            "Could not mark index %s read: %s", msg.get("Index"), e
+                        log.warning("Could not mark index %s read: %s", msg.get("Index"), e)
+
+                    # Fire instant webhook
+                    if not is_spam:
+                        wh_type = "delivery_report" if is_dr else "sms_received"
+                        fire_webhook_async(
+                            {
+                                "type": wh_type,
+                                "id": row_id,
+                                "phone": msg.get("Phone"),
+                                "content": msg.get("Content"),
+                                "date": msg.get("Date"),
+                                "sms_type": msg.get("SmsType"),
+                            }
                         )
 
-                    # Push webhook
-                    wh_type = "delivery_report" if is_dr else "sms_received"
-                    fire_webhook_async(
-                        {
-                            "type": wh_type,
-                            "id": row_id,
-                            "phone": msg.get("Phone"),
-                            "content": msg.get("Content"),
-                            "date": msg.get("Date"),
-                            "sms_type": msg.get("SmsType"),
-                        }
-                    )
+                        log_text = (msg.get("Content") or "").replace("\n", " ")
+                        if len(log_text) > 80:
+                            log_text = log_text[:77] + "..."
+                        log.info("[%s] From %s: %s", wh_type, msg.get("Phone"), log_text)
 
-                    log.info(
-                        "[%s] From %s: %s",
-                        wh_type,
-                        msg.get("Phone"),
-                        (msg.get("Content") or "")[:60],
-                    )
-                    if wh_type == "sms_received":
-                        mark_sms_received()
+                        if wh_type == "sms_received":
+                            mark_sms_received()
+                    else:
+                        log.info("Dropped spam duplicate from %s", msg.get("Phone"))
 
             had_failures, recovered_failure_count = mark_modem_poll_success()
 
@@ -870,13 +1082,48 @@ def send_sms():
         return jsonify({"error": "Requires 'to' and 'message' fields"}), 400
 
     recipients = body["to"] if isinstance(body["to"], list) else [body["to"]]
+    recipients = [normalize_phone(r) for r in recipients if str(r).strip()]
+    if not recipients:
+        return jsonify({"error": "No valid recipients provided"}), 400
+
     message = body["message"]
     delivery_report = bool(body.get("delivery_report", True))
+    wait_send_status = bool(body.get("wait_send_status", True))
+    status_wait_seconds = parse_positive_float(
+        body.get("status_wait_seconds"), SMS_SEND_STATUS_WAIT_SECONDS
+    )
 
     with get_client() as c:
-        # huawei-lte-api 1.11.0 does not expose a delivery-report flag in send_sms().
-        result = c.sms.send_sms(recipients, message)
-    log.info("SMS sent to %s (dr=%s): %s", recipients, delivery_report, result)
+        send_outcome = None
+        try:
+            # huawei-lte-api 1.11.0 does not expose a delivery-report flag in send_sms().
+            result = c.sms.send_sms(recipients, message)
+        except Exception as e:
+            code = parse_modem_error_code(e)
+            if code == 113018 and wait_send_status:
+                # Some firmware returns 113018 for queued/interconnect failures.
+                # Query send-status immediately to classify recipient-level outcome.
+                send_outcome = wait_for_send_outcome(c, recipients, status_wait_seconds)
+                result = "ERROR_113018"
+            else:
+                raise
+
+        if wait_send_status and send_outcome is None:
+            send_outcome = wait_for_send_outcome(c, recipients, status_wait_seconds)
+
+    if send_outcome:
+        log.info(
+            "SMS sent to %s (dr=%s): %s, status=%s success=%s fail=%s pending=%s",
+            recipients,
+            delivery_report,
+            result,
+            send_outcome.get("state"),
+            send_outcome.get("successful_recipients"),
+            send_outcome.get("failed_recipients"),
+            send_outcome.get("pending_recipients"),
+        )
+    else:
+        log.info("SMS sent to %s (dr=%s): %s", recipients, delivery_report, result)
 
     # Store in sent_messages table
     with get_bg_db() as db:
@@ -885,13 +1132,23 @@ def send_sms():
             (json.dumps(recipients), message),
         )
 
-    return jsonify(
-        {
-            "result": result,
-            "to": recipients,
-            "message": message,
-            "delivery_report": delivery_report,
-        }
+    send_verdict = evaluate_send_result(result, recipients, send_outcome)
+    http_status = 200 if send_verdict["ok"] else 502
+
+    return (
+        jsonify(
+            {
+                "ok": send_verdict["ok"],
+                "state": send_verdict["state"],
+                "reason": send_verdict["reason"],
+                "result": result,
+                "to": recipients,
+                "message": message,
+                "delivery_report": delivery_report,
+                "send_status": send_outcome,
+            }
+        ),
+        http_status,
     )
 
 
