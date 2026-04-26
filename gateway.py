@@ -901,6 +901,65 @@ def poll_ussd_response(client, timeout=USSD_POLL_TIMEOUT):
     raise TimeoutError("USSD response not received within timeout")
 
 
+def release_ussd_session(client):
+    """
+    Best-effort USSD session release across firmware/API variants.
+    """
+    ussd_api = client.ussd
+    for method_name in ("set_release", "cancel"):
+        method = getattr(ussd_api, method_name, None)
+        if callable(method):
+            try:
+                method()
+                return
+            except Exception:
+                continue
+
+
+def poll_ussd_status(client, timeout=USSD_POLL_TIMEOUT):
+    """
+    Poll USSD status until the modem reports a non-idle state.
+    Falls back to `ussd.get()` when status payload is unavailable.
+    """
+    for _ in range(timeout):
+        try:
+            status = client.ussd.status() or {}
+            raw_status = status.get("UssdStatus", status.get("status", 0))
+            try:
+                ussd_status = int(raw_status)
+            except (TypeError, ValueError):
+                ussd_status = 0
+
+            content = (
+                status.get("UssdContent")
+                or status.get("content")
+                or status.get("Message")
+                or ""
+            )
+
+            if ussd_status != 0 or content:
+                session_active = ussd_status == 1 if ussd_status in (1, 2) else True
+                return {
+                    "content": content,
+                    "status": ussd_status,
+                    "session_active": session_active,
+                }
+        except Exception:
+            pass
+
+        # Compatibility fallback for older modem APIs.
+        try:
+            resp = client.ussd.get()
+            if resp and resp.get("content"):
+                return {"content": resp["content"], "status": 1, "session_active": True}
+        except Exception:
+            pass
+
+        time.sleep(USSD_POLL_INTERVAL)
+
+    raise TimeoutError("USSD response not received within timeout")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  REST ENDPOINTS — CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1303,6 +1362,89 @@ def ussd_session():
                     break
 
         return jsonify({"steps_run": len(history), "history": history})
+    finally:
+        ussd_lock.release()
+
+
+@app.post("/api/ussd/send")
+@require_auth
+def ussd_send_stateless():
+    """
+    Stateless USSD start endpoint.
+    Body JSON: {"code":"*127#"}
+    """
+    body = request.get_json(force=True) or {}
+    code = body.get("code")
+    if not code:
+        return jsonify({"error": "Requires 'code' field"}), 400
+
+    if not ussd_lock.acquire(blocking=False):
+        return jsonify({"error": "A USSD session is in progress. End it first."}), 423
+
+    try:
+        with get_client() as c:
+            release_ussd_session(c)  # clear stale modem state before a new code
+            code = str(code)
+            log.info("USSD stateless send: %s", code)
+            c.ussd.send(code)
+            try:
+                return jsonify(poll_ussd_status(c))
+            except TimeoutError:
+                return jsonify({"error": "Network timeout"}), 504
+    except Exception as e:
+        log.warning("USSD stateless send failed: %s", e)
+        return jsonify({"error": str(e)}), 502
+    finally:
+        ussd_lock.release()
+
+
+@app.post("/api/ussd/reply")
+@require_auth
+def ussd_reply_stateless():
+    """
+    Stateless USSD reply endpoint.
+    Body JSON: {"text":"2"}
+    """
+    body = request.get_json(force=True) or {}
+    text = body.get("text")
+    if text is None:
+        return jsonify({"error": "Requires 'text' field"}), 400
+
+    if not ussd_lock.acquire(blocking=False):
+        return jsonify({"error": "A USSD session is in progress. End it first."}), 423
+
+    try:
+        with get_client() as c:
+            text = str(text)
+            log.info("USSD stateless reply: %s", text)
+            c.ussd.send(text)
+            try:
+                return jsonify(poll_ussd_status(c))
+            except TimeoutError:
+                return jsonify({"error": "Network timeout"}), 504
+    except Exception as e:
+        log.warning("USSD stateless reply failed: %s", e)
+        return jsonify({"error": str(e)}), 502
+    finally:
+        ussd_lock.release()
+
+
+@app.post("/api/ussd/cancel")
+@require_auth
+def ussd_cancel_stateless():
+    """
+    Stateless USSD cancel endpoint.
+    """
+    if not ussd_lock.acquire(blocking=False):
+        return jsonify({"error": "A USSD session is in progress. End it first."}), 423
+
+    try:
+        with get_client() as c:
+            release_ussd_session(c)
+        return jsonify({"status": "cancelled"})
+    except Exception as e:
+        log.warning("USSD stateless cancel failed: %s", e)
+        return jsonify({"error": str(e)}), 502
     finally:
         ussd_lock.release()
 
